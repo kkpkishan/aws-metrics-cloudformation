@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring AWS S3 bucket sizes and object counts across regions, and sending daily summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  s3function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+          
+          def lambda_handler(event, context):
+              # Initialize S3 and SNS clients
+              s3_client = boto3.client('s3')
+              sns_client = boto3.client('sns')
+          
+              # Get list of all S3 buckets
+              buckets = s3_client.list_buckets()['Buckets']
+          
+              # Dictionary to hold bucket size and object count info by region
+              region_buckets_info = {}
+          
+              for bucket in buckets:
+                  bucket_name = bucket['Name']
+          
+                  # Get the region of the bucket
+                  bucket_location = s3_client.get_bucket_location(Bucket=bucket_name)['LocationConstraint']
+                  region = bucket_location if bucket_location else 'us-east-1'  # 'us-east-1' is represented as None
+          
+                  if region not in region_buckets_info:
+                      region_buckets_info[region] = ""
+          
+                  # Initialize CloudWatch client for the specific region
+                  cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+          
+                  # Fetch BucketSizeBytes and NumberOfObjects metrics for the bucket for the current day
+                  current_date = datetime.datetime.now()
+                  bucket_size_data = get_metric_statistics(cloudwatch_client, bucket_name, 'BucketSizeBytes', 'AWS/S3', current_date, 'Sum')
+                  object_count_data = get_metric_statistics(cloudwatch_client, bucket_name, 'NumberOfObjects', 'AWS/S3', current_date, 'Average')
+          
+                  # Calculate total size in GB and object count
+                  total_bucket_size_gb = format(calculate_metric(bucket_size_data, 'Sum') / (1024 ** 3), '.2f') + ' GB'
+                  total_object_count = calculate_metric(object_count_data, 'Average')
+          
+                  # Append to the region's info
+                  region_buckets_info[region] += f"Bucket: {bucket_name}, Size: {total_bucket_size_gb}, Objects: {total_object_count}\n"
+          
+              # Build the final message
+              message = "AWS S3 Bucket Sizes and Object Counts (current day):\n"
+              for region, buckets_info in region_buckets_info.items():
+                  message += f"Region: {region}\n{buckets_info}\n"
+          
+              # Send the message via SNS
+              #sns_client.publish(TopicArn='TOPIC_ARN', Message=message)
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+          
+          def get_metric_statistics(cloudwatch_client, bucket_name, metric_name, namespace, date, statistic):
+              # Define timestamps for the current day
+              end_time = datetime.datetime.combine(date, datetime.datetime.min.time())
+              start_time = end_time - datetime.timedelta(days=1)
+          
+              response = cloudwatch_client.get_metric_statistics(
+                  Namespace=namespace,
+                  MetricName=metric_name,
+                  Dimensions=[
+                      {
+                          'Name': 'BucketName',
+                          'Value': bucket_name
+                      },
+                      {
+                          'Name': 'StorageType',
+                          'Value': 'AllStorageTypes' if metric_name == 'NumberOfObjects' else 'StandardStorage'
+                      }
+                  ],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=86400,  # 1 day
+                  Statistics=[statistic]
+              )
+              return response['Datapoints']
+          
+          def calculate_metric(metric_data, statistic):
+              if not metric_data:
+                  return 0
+              if statistic == 'Sum':
+                  total = sum(datapoint['Sum'] for datapoint in metric_data)
+              elif statistic == 'Average':
+                  total = sum(datapoint['Average'] for datapoint in metric_data) / len(metric_data) if metric_data else 0
+              return total
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  s3MonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt s3function.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref s3function
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt s3MonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt s3function.Arn

@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring AWS ALB request counts for target groups across regions and sending monthly summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  albrequestcountfunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import calendar
+          import os
+          
+          def lambda_handler(event, context):
+              # Initialize SNS and STS clients
+              sns_client = boto3.client('sns')
+              sts_client = boto3.client('sts')
+          
+              # Get AWS account ID
+              account_id = sts_client.get_caller_identity()["Account"]
+          
+              # Get a list of all regions
+              ec2 = boto3.client('ec2')
+              regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+          
+              # Dictionary to hold target groups by region
+              target_groups_by_region = {}
+          
+              # Collect target groups across all regions
+              for region in regions:
+                  elbv2_client = boto3.client('elbv2', region_name=region)
+                  target_groups = elbv2_client.describe_target_groups()['TargetGroups']
+          
+                  for target_group in target_groups:
+                      target_group_arn = target_group['TargetGroupArn']
+                      # Extract the necessary part of the ARN
+                      target_group_short_arn = '/'.join(target_group_arn.split('/')[-3:])
+                      target_group_name = target_group['TargetGroupName']
+                      if region not in target_groups_by_region:
+                          target_groups_by_region[region] = []
+                      target_groups_by_region[region].append((target_group_short_arn, target_group_name))
+          
+              # Initialize message with AWS account ID
+              message = f"ALB Target Group Request Count Report for AWS Account ID: {account_id}\n"
+          
+              # Current and previous month timestamps
+              end = datetime.datetime.now()
+              start = end.replace(day=1)  # Start of current month
+              current_month = end.strftime("%B %Y")
+              previous_month = (start - datetime.timedelta(days=1)).strftime("%B %Y")
+          
+              # Process target groups region-wise
+              for region, target_groups in target_groups_by_region.items():
+                  if target_groups:
+                      message += f"\nRegion: {region}\n"
+                      cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+                      for target_group_short_arn, target_group_name in target_groups:
+                          message += process_target_group(cloudwatch_client, target_group_short_arn, target_group_name, current_month, previous_month)
+          
+              # Send one notification with all data
+             #sns_client.publish(TopicArn='TOPIC_ARN', Message=message)
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+              
+          def process_target_group(cloudwatch_client, target_group_short_arn, target_group_name, current_month, previous_month):
+              now = datetime.datetime.now()
+              start_current_month = datetime.datetime(now.year, now.month, 1)
+              end_current_month = datetime.datetime(now.year, now.month, calendar.monthrange(now.year, now.month)[1], 23, 59, 59)
+          
+              start_previous_month = start_current_month - datetime.timedelta(days=1)
+              start_previous_month = datetime.datetime(start_previous_month.year, start_previous_month.month, 1)
+              end_previous_month = datetime.datetime(start_current_month.year, start_current_month.month, 1, 0, 0, 0) - datetime.timedelta(seconds=1)
+          
+              current_requests = get_request_count(cloudwatch_client, target_group_short_arn, start_current_month, end_current_month)
+              previous_requests = get_request_count(cloudwatch_client, target_group_short_arn, start_previous_month, end_previous_month)
+          
+              return f"  - Target Group: {target_group_name} - {current_month} Requests: {current_requests:,}, {previous_month} Requests: {previous_requests:,}\n"
+          
+          def get_request_count(cloudwatch_client, target_group_short_arn, start, end):
+              period = 2592000  # 30 days
+          
+              response = cloudwatch_client.get_metric_statistics(
+                  Namespace='AWS/ApplicationELB',
+                  MetricName='RequestCountPerTarget',
+                  Dimensions=[
+                      {
+                          'Name': 'TargetGroup',
+                          'Value': target_group_short_arn
+                      },
+                  ],
+                  StartTime=start,
+                  EndTime=end,
+                  Period=period,
+                  Statistics=['Sum']
+              )
+          
+              request_count = sum(datapoint['Sum'] for datapoint in response['Datapoints'])
+              return request_count
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - cloudwatch:GetMetricStatistics
+                  - ec2:DescribeRegions
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  albrequestcountMonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt albrequestcountfunction.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref albrequestcountfunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt albrequestcountMonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt albrequestcountfunction.Arn

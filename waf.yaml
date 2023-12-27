@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring AWS WAF metrics across multiple regions and sending monthly summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  waffunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+          
+          def lambda_handler(event, context):
+              # Initialize STS and SNS clients
+              sts_client = boto3.client('sts')
+              sns_client = boto3.client('sns')
+          
+              # Get AWS account ID and region of the Lambda function
+              account_id = sts_client.get_caller_identity()["Account"]
+              lambda_region = boto3.session.Session().region_name
+          
+              # Initialize message
+              message = f"AWS Account ID: {account_id}, Lambda Function Region: {lambda_region}\n"
+          
+              # Get a list of all regions
+              ec2 = boto3.client('ec2', region_name=lambda_region)
+              regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+          
+              for region in regions:
+                  # Initialize CloudWatch and WAFV2 clients for the region
+                  cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+                  wafv2_client = boto3.client('wafv2', region_name=region)
+          
+                  # List Web ACLs in the region
+                  web_acls = list_web_acls(wafv2_client)
+          
+                  for web_acl in web_acls:
+                      web_acl_name = web_acl['Name']
+                      web_acl_arn = web_acl['ARN']
+                      message += process_web_acl(cloudwatch_client, web_acl_name, region, web_acl_arn)
+          
+              # Send one notification with all data
+              #sns_client.publish(TopicArn='TOPIC_ARN', Message=message)
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+          
+          def list_web_acls(wafv2_client):
+              # List the Web ACLs
+              try:
+                  response = wafv2_client.list_web_acls(Scope='REGIONAL')
+                  return response.get('WebACLs', [])
+              except Exception as e:
+                  print(f"Error listing Web ACLs: {e}")
+                  return []
+          
+          def process_web_acl(cloudwatch_client, web_acl_name, region, web_acl_arn):
+              # Define timestamps for current and previous month
+              now = datetime.datetime.now()
+              start_current_month = datetime.datetime(now.year, now.month, 1, 0, 0, 0)
+              end_current_month = datetime.datetime(now.year, now.month, now.day, 23, 59, 59)
+              first_day_prev_month = start_current_month - datetime.timedelta(days=1)
+              start_prev_month = datetime.datetime(first_day_prev_month.year, first_day_prev_month.month, 1, 0, 0, 0)
+              end_prev_month = datetime.datetime(first_day_prev_month.year, first_day_prev_month.month, first_day_prev_month.day, 23, 59, 59)
+          
+              # Fetch BlockedRequests and AllowedRequests metrics
+              current_blocked_requests = get_metric_statistics(cloudwatch_client, web_acl_name, region, start_current_month, end_current_month, 'BlockedRequests', 'AWS/WAFV2')
+              previous_blocked_requests = get_metric_statistics(cloudwatch_client, web_acl_name, region, start_prev_month, end_prev_month, 'BlockedRequests', 'AWS/WAFV2')
+              current_allowed_requests = get_metric_statistics(cloudwatch_client, web_acl_name, region, start_current_month, end_current_month, 'AllowedRequests', 'AWS/WAFV2')
+              previous_allowed_requests = get_metric_statistics(cloudwatch_client, web_acl_name, region, start_prev_month, end_prev_month, 'AllowedRequests', 'AWS/WAFV2')
+          
+              # Calculate sums
+              current_sum_blocked = sum(datapoint['Sum'] for datapoint in current_blocked_requests)
+              previous_sum_blocked = sum(datapoint['Sum'] for datapoint in previous_blocked_requests)
+              current_sum_allowed = sum(datapoint['Sum'] for datapoint in current_allowed_requests)
+              previous_sum_allowed = sum(datapoint['Sum'] for datapoint in previous_allowed_requests)
+          
+              # Build the message
+              return f"Web ACL Name: {web_acl_name}, ARN: {web_acl_arn}, Region: {region}\n" \
+                     f"    - Current Month (End: {end_current_month.strftime('%d/%m/%Y')})\n" \
+                     f"        Blocked Requests: {current_sum_blocked}, Allowed Requests: {current_sum_allowed}\n" \
+                     f"    - Previous Month (End: {end_prev_month.strftime('%d/%m/%Y')})\n" \
+                     f"        Blocked Requests: {previous_sum_blocked}, Allowed Requests: {previous_sum_allowed}\n\n"
+          
+          def get_metric_statistics(cloudwatch_client, web_acl_name, region, start, end, metric_name, namespace):
+              return cloudwatch_client.get_metric_statistics(
+                  Namespace=namespace,
+                  MetricName=metric_name,
+                  Dimensions=[
+                      {
+                          'Name': 'WebACL',
+                          'Value': web_acl_name
+                      },
+                      {
+                          'Name': 'Region',
+                          'Value': region
+                      },
+                      {
+                          'Name': 'Rule',
+                          'Value': 'ALL'
+                      }
+                  ],
+                  StartTime=start,
+                  EndTime=end,
+                  Period=2592000,  # Adjusted as per your provided period
+                  Statistics=['Sum']
+              )['Datapoints']
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - sts:GetCallerIdentity
+                  - ec2:DescribeRegions
+                  - wafv2:ListWebACLs
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  wafMonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt waffunction.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref waffunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt wafMonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt waffunction.Arn

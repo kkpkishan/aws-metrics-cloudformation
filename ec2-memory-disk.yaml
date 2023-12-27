@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring CPU and network,disk usage metrics of EC2 instances across multiple regions and sending monthly summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+  CWAgentNamespace:
+    Description: The namespace for the CloudWatch Agent
+    Type: String
+    Default: CWAgent
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  ec2memorydiskfunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+          
+          def lambda_handler(event, context):
+              # Initialize STS and SNS clients
+              sts_client = boto3.client('sts')
+              sns_client = boto3.client('sns')
+          
+              # Get AWS account ID and region of the Lambda function
+              account_id = sts_client.get_caller_identity()["Account"]
+              lambda_region = boto3.session.Session().region_name
+          
+              # Get a list of all regions
+              ec2 = boto3.client('ec2', region_name=lambda_region)
+              regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+          
+              # Initialize message
+              message = f"AWS Account ID: {account_id}, Lambda Function Region: {lambda_region}\n"
+          
+              # Retrieve the CWAgent namespace from environment variable
+              cwagent_namespace = os.environ['CWAGENT_NAMESPACE']
+          
+              # Iterate over all regions and process instances
+              for region in regions:
+                  region_message_added = False
+          
+                  ec2_client = boto3.client('ec2', region_name=region)
+                  cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+          
+                  instances = ec2_client.describe_instances()
+                  instance_ids = [instance['InstanceId'] for reservation in instances['Reservations'] for instance in reservation['Instances']]
+          
+                  for instance_id in instance_ids:
+                      instance_message = process_instance(instance_id, cloudwatch_client, cwagent_namespace)
+          
+                      if instance_message:
+                          if not region_message_added:
+                              message += f"Region: {region}\n"
+                              region_message_added = True
+                          message += instance_message
+          
+              # Send one notification with all data
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+          
+          def process_instance(instance_id, cloudwatch_client, cwagent_namespace):
+              # Define timestamps for current and previous month
+              now = datetime.datetime.now()
+              start_current_month = datetime.datetime(now.year, now.month, 1, 0, 0, 0)
+              end_current_month = datetime.datetime(now.year, now.month, now.day, 23, 59, 59)
+              first_day_prev_month = start_current_month - datetime.timedelta(days=1)
+              start_prev_month = datetime.datetime(first_day_prev_month.year, first_day_prev_month.month, 1, 0, 0, 0)
+              end_prev_month = datetime.datetime(first_day_prev_month.year, first_day_prev_month.month, first_day_prev_month.day, 23, 59, 59)
+          
+              # Fetch memory and disk utilization metrics
+              current_memory_data = get_metric_statistics(cloudwatch_client, instance_id, start_current_month, end_current_month, 'mem_used_percent', cwagent_namespace)
+              previous_memory_data = get_metric_statistics(cloudwatch_client, instance_id, start_prev_month, end_prev_month, 'mem_used_percent', cwagent_namespace)
+              current_disk_data = get_metric_statistics(cloudwatch_client, instance_id, start_current_month, end_current_month, 'disk_used_percent', cwagent_namespace)
+              previous_disk_data = get_metric_statistics(cloudwatch_client, instance_id, start_prev_month, end_prev_month, 'disk_used_percent', cwagent_namespace)
+          
+              # Calculate averages
+              current_avg_memory = format(calculate_average(current_memory_data), '.2f') + '%'
+              previous_avg_memory = format(calculate_average(previous_memory_data), '.2f') + '%'
+              current_avg_disk = format(calculate_average(current_disk_data), '.2f') + '%'
+              previous_avg_disk = format(calculate_average(previous_disk_data), '.2f') + '%'
+          
+              # Build the message for the instance
+              return f"Instance ID: {instance_id}\n" \
+                     f"    - Current Month (End: {end_current_month.strftime('%d/%m/%Y')})\n" \
+                     f"        Memory Utilization: {current_avg_memory}, Disk Utilization: {current_avg_disk}\n" \
+                     f"    - Previous Month (End: {end_prev_month.strftime('%d/%m/%Y')})\n" \
+                     f"        Memory Utilization: {previous_avg_memory}, Disk Utilization: {previous_avg_disk}\n\n"
+          
+          def get_metric_statistics(cloudwatch_client, instance_id, start, end, metric_name, namespace):
+              response = cloudwatch_client.get_metric_statistics(
+                  Namespace=namespace,
+                  MetricName=metric_name,
+                  Dimensions=[
+                      {
+                          'Name': 'InstanceId',
+                          'Value': instance_id
+                      },
+                  ],
+                  StartTime=start,
+                  EndTime=end,
+                  Period=3600,
+                  Statistics=['Average']
+              )
+              return response['Datapoints']
+          
+          def calculate_average(metric_data):
+              if not metric_data:
+                  return 0
+              total = sum(datapoint['Average'] for datapoint in metric_data)
+              average = total / len(metric_data)
+              return average
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+          CWAGENT_NAMESPACE: !Ref CWAgentNamespace
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - cloudwatch:GetMetricStatistics
+                  - ec2:DescribeRegions
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  ec2memorydiskMonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt ec2memorydiskfunction.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ec2memorydiskfunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ec2memorydiskMonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt ec2memorydiskfunction.Arn

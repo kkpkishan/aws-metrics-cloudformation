@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring Amazon SES metrics across multiple regions, and sending monthly summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  sesfunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+          def lambda_handler(event, context):
+              # Initialize STS and SNS clients
+              sts_client = boto3.client('sts')
+              sns_client = boto3.client('sns')
+          
+              # Get AWS account ID and region of the Lambda function
+              account_id = sts_client.get_caller_identity()["Account"]
+              lambda_region = boto3.session.Session().region_name
+          
+              # Initialize message
+              message = f"AWS Account ID: {account_id}, Lambda Function Region: {lambda_region}\n"
+          
+              # Get a list of all regions
+              ec2 = boto3.client('ec2', region_name=lambda_region)
+              regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+          
+              for region in regions:
+                  # Initialize CloudWatch client for the region
+                  cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+          
+                  # Process SES metrics
+                  message += process_ses_metrics(cloudwatch_client, region)
+          
+              # Send one notification with all data
+              #sns_client.publish(TopicArn='TOPIC_ARN', Message=message)
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+          
+          def process_ses_metrics(cloudwatch_client, region):
+              # Define timestamps for current and previous month
+              now = datetime.datetime.now()
+              start_current_month = datetime.datetime(now.year, now.month, 1, 0, 0, 0)
+              end_current_month = datetime.datetime(now.year, now.month, now.day, 23, 59, 59)
+              first_day_prev_month = start_current_month - datetime.timedelta(days=1)
+              start_prev_month = datetime.datetime(first_day_prev_month.year, first_day_prev_month.month, 1, 0, 0, 0)
+              end_prev_month = datetime.datetime(first_day_prev_month.year, first_day_prev_month.month, first_day_prev_month.day, 23, 59, 59)
+          
+              # Fetch SES metrics
+              metrics = ['Delivery', 'Reputation.BounceRate', 'Reputation.ComplaintRate']
+              metrics_data = {}
+              for metric_name in metrics:
+                  current_data = get_metric_statistics(cloudwatch_client, start_current_month, end_current_month, metric_name, 'AWS/SES')
+                  previous_data = get_metric_statistics(cloudwatch_client, start_prev_month, end_prev_month, metric_name, 'AWS/SES')
+                  metrics_data[metric_name] = {
+                      'current': sum(datapoint['Sum'] for datapoint in current_data),
+                      'previous': sum(datapoint['Sum'] for datapoint in previous_data)
+                  }
+          
+              # Build the message
+              message = f"Region: {region}\n"
+              for metric_name, data in metrics_data.items():
+                  message += f"    - {metric_name} (Current Month - End: {end_current_month.strftime('%d/%m/%Y')}): {data['current']}\n"
+                  message += f"    - {metric_name} (Previous Month - End: {end_prev_month.strftime('%d/%m/%Y')}): {data['previous']}\n"
+              return message + "\n"
+          
+          def get_metric_statistics(cloudwatch_client, start, end, metric_name, namespace):
+              return cloudwatch_client.get_metric_statistics(
+                  Namespace=namespace,
+                  MetricName=metric_name,
+                  Dimensions=[],  # No 'Region' dimension for SES metrics
+                  StartTime=start,
+                  EndTime=end,
+                  Period=2592000,  # Adjusted as per your provided period
+                  Statistics=['Sum']
+              )['Datapoints']         
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - sts:GetCallerIdentity
+                  - ec2:DescribeRegions
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  sesMonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt sesfunction.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref sesfunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt sesMonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt sesfunction.Arn

@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring CPU  usage metrics of EC2 instances across multiple regions and sending monthly summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  ec2cpufunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+
+          def lambda_handler(event, context):
+              # Initialize STS and SNS clients
+              sts_client = boto3.client('sts')
+              sns_client = boto3.client('sns')
+          
+              # Get AWS account ID and region of the Lambda function
+              account_id = sts_client.get_caller_identity()["Account"]
+              lambda_region = boto3.session.Session().region_name
+          
+              # Get a list of all regions
+              ec2 = boto3.client('ec2', region_name=lambda_region)
+              regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+          
+              # Initialize message
+              message = f"AWS Account ID: {account_id}, Lambda Function Region: {lambda_region}\n"
+          
+              # Iterate over all regions
+              for region in regions:
+                  # Initialize EC2 and CloudWatch clients for each region
+                  ec2_client = boto3.client('ec2', region_name=region)
+                  cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+          
+                  # Fetch EC2 instance IDs for the current region
+                  instances = ec2_client.describe_instances()
+                  instance_ids = [instance['InstanceId'] for reservation in instances['Reservations'] for instance in reservation['Instances']]
+          
+                  # Process each instance in the region
+                  for instance_id in instance_ids:
+                      message += process_instance(instance_id, cloudwatch_client)
+          
+              # Send one notification with all data
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+          
+          def process_instance(instance_id, cloudwatch_client):
+              # Current and previous month timestamps
+              end = datetime.datetime.now()
+              start = end.replace(day=1)  # Start of current month
+          
+              # Calculating the first and last day of the previous month
+              first_day_prev_month = start - datetime.timedelta(days=1)
+              first_day_prev_month = first_day_prev_month.replace(day=1)
+              last_day_prev_month = start - datetime.timedelta(days=1)
+          
+              # Format timestamps
+              current_month_timestamp = end.strftime('%d/%m/%Y')
+              previous_month_timestamp = last_day_prev_month.strftime('%d/%m/%Y')
+          
+              # Fetch CPU utilization for current and previous month
+              current_cpu_data = get_cpu_utilization(cloudwatch_client, instance_id, start, end)
+              previous_cpu_data = get_cpu_utilization(cloudwatch_client, instance_id, first_day_prev_month, last_day_prev_month)
+          
+              # Calculate average CPU utilization and format to two decimal places
+              current_avg_cpu = format(calculate_average(current_cpu_data), '.2f') + '%'
+              previous_avg_cpu = format(calculate_average(previous_cpu_data), '.2f') + '%'
+          
+              # Build the message for the instance
+              return f"Region: {cloudwatch_client.meta.region_name}, Instance ID: {instance_id} - Current Month (End: {current_month_timestamp}) Average CPU: {current_avg_cpu}, Previous Month (End: {previous_month_timestamp}) Average CPU: {previous_avg_cpu}\n"
+          
+          def get_cpu_utilization(cloudwatch_client, instance_id, start, end):
+              response = cloudwatch_client.get_metric_statistics(
+                  Namespace='AWS/EC2',
+                  MetricName='CPUUtilization',
+                  Dimensions=[
+                      {
+                          'Name': 'InstanceId',
+                          'Value': instance_id
+                      },
+                  ],
+                  StartTime=start,
+                  EndTime=end,
+                  Period=2592000,
+                  Statistics=['Average']
+              )
+              return response['Datapoints']
+          
+          def calculate_average(cpu_data):
+              if not cpu_data:
+                  return 0
+          
+              total = sum(datapoint['Average'] for datapoint in cpu_data)
+              average = total / len(cpu_data)
+              return average
+
+
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - cloudwatch:GetMetricStatistics
+                  - ec2:DescribeRegions
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  ec2cpuMonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt ec2cpufunction.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ec2cpufunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ec2cpuMonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt ec2cpufunction.Arn
