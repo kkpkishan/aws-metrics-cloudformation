@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring memory, disk, and connection metrics of RDS instances across regions, and sending monthly summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  rdsmemorydiskconnectionfunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+          import json
+          
+          def lambda_handler(event, context):
+              sts_client = boto3.client('sts')
+              sns_client = boto3.client('sns')
+              account_id = sts_client.get_caller_identity()["Account"]
+              lambda_region = boto3.session.Session().region_name
+              ec2 = boto3.client('ec2', region_name=lambda_region)
+              regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+          
+              report = {
+                  "AWS Account ID": account_id,
+                  "Lambda Function Region": lambda_region,
+                  "RDS Instances": []
+              }
+          
+              for region in regions:
+                  rds_client = boto3.client('rds', region_name=region)
+                  cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+          
+                  instances_response = rds_client.describe_db_instances()
+                  for instance in instances_response['DBInstances']:
+                      instance_id = instance['DBInstanceIdentifier']
+                      tags_response = rds_client.list_tags_for_resource(ResourceName=instance['DBInstanceArn'])
+                      instance_name = get_instance_name(tags_response['TagList'])
+                      instance_data = process_instance(instance_id, instance_name, cloudwatch_client)
+                      report["RDS Instances"].append(instance_data)
+          
+              message = json.dumps(report, indent=4)
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+          
+          def get_instance_name(tags):
+              for tag in tags:
+                  if tag['Key'] == 'Name':
+                      return tag['Value']
+              return "Null"
+          
+          def process_instance(instance_id, instance_name, cloudwatch_client):
+              now = datetime.datetime.now()
+              start_current_month, end_current_month = get_month_range(now, True)
+              start_prev_month, end_prev_month = get_month_range(now, False)
+          
+              metrics = {
+                  'CPUUtilization': 'AWS/RDS',
+                  'FreeStorageSpace': 'AWS/RDS',
+                  'FreeableMemory': 'AWS/RDS',
+                  'WriteIOPS': 'AWS/RDS',
+                  'ReadIOPS': 'AWS/RDS',
+                  'DatabaseConnections': 'AWS/RDS'
+              }
+              metrics_data = {metric: {} for metric in metrics}
+              for metric, namespace in metrics.items():
+                  current_data = get_metric_statistics(cloudwatch_client, instance_id, start_current_month, end_current_month, metric, namespace)
+                  previous_data = get_metric_statistics(cloudwatch_client, instance_id, start_prev_month, end_prev_month, metric, namespace)
+                  metrics_data[metric] = {
+                      "Current Month": format_metrics(metric, current_data),
+                      "Previous Month": format_metrics(metric, previous_data)
+                  }
+          
+              return {
+                  "RDS Name": instance_name,
+                  "RDS ID": instance_id,
+                  "Metrics": metrics_data
+              }
+          
+          def get_month_range(now, is_current):
+              if is_current:
+                  start_month = datetime.datetime(now.year, now.month, 1)
+                  end_month = datetime.datetime(now.year, now.month, now.day, 23, 59, 59)
+              else:
+                  start_month = (now.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
+                  end_month = now.replace(day=1) - datetime.timedelta(seconds=1)
+              return start_month, end_month
+          
+          def get_metric_statistics(cloudwatch_client, instance_id, start, end, metric_name, namespace):
+              response = cloudwatch_client.get_metric_statistics(
+                  Namespace=namespace,
+                  MetricName=metric_name,
+                  Dimensions=[
+                      {
+                          'Name': 'DBInstanceIdentifier',
+                          'Value': instance_id
+                      },
+                  ],
+                  StartTime=start,
+                  EndTime=end,
+                  Period=3600,
+                  Statistics=['Average']
+              )
+              return response['Datapoints']
+          
+          def format_metrics(metric, data):
+              if metric in ['FreeStorageSpace', 'FreeableMemory']:
+                  # Convert bytes to GB
+                  average = calculate_average(data) / (1024 ** 3)
+                  return f"{average:.2f} GB"
+              elif metric in ['CPUUtilization']:
+                  average = calculate_average(data)
+                  return f"{average:.2f}%"
+              else:
+                  # IOPS and Connections don't need conversion
+                  average = calculate_average(data)
+                  return f"{average:.2f}"
+          
+          def calculate_average(metric_data):
+              if not metric_data:
+                  return 0
+              total = sum(datapoint['Average'] for datapoint in metric_data)
+              return total / len(metric_data) if metric_data else 0
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - cloudwatch:GetMetricStatistics
+                  - ec2:DescribeRegions
+                  - rds:DescribeDBInstances
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  rdsmemorydiskconnectionMonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt rdsmemorydiskconnectionfunction.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rdsmemorydiskconnectionfunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt rdsmemorydiskconnectionMonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt rdsmemorydiskconnectionfunction.Arn
