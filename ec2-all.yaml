@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Lambda function for monitoring CPU and network usage metrics of EC2 instances across multiple regions and sending monthly summaries via SNS.
+
+Parameters:
+  ScheduleExpression:
+    Description: Cron expression for the schedule
+    Type: String
+    Default: cron(0 0 1 * ? *)
+  ParentAlertStack:
+    Description: The name of the parent stack that exports the SNS topic ARN
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Parent Stacks'
+        Parameters:
+          - ParentAlertStack
+
+Resources:
+  ec2cpunetworkfunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+          
+          # Use the CWAGENT_NAMESPACE environment variable for specific metrics
+          CWAGENT_NAMESPACE = os.environ.get('CWAGENT_NAMESPACE', 'CWAgent')
+          
+          def lambda_handler(event, context):
+              sts_client = boto3.client('sts')
+              sns_client = boto3.client('sns')
+          
+              account_id = sts_client.get_caller_identity()["Account"]
+              lambda_region = boto3.session.Session().region_name
+          
+              ec2 = boto3.client('ec2', region_name=lambda_region)
+              regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+          
+              message = f"AWS Account ID: {account_id}, Lambda Function Region: {lambda_region}\n"
+          
+              last_region = None
+              for region in regions:
+                  ec2_client = boto3.client('ec2', region_name=region)
+                  cloudwatch_client = boto3.client('cloudwatch', region_name=region)
+                  instances = ec2_client.describe_instances()
+          
+                  for reservation in instances['Reservations']:
+                      for instance in reservation['Instances']:
+                          instance_id = instance['InstanceId']
+                          instance_name = next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), 'null')
+          
+                          if region != last_region:
+                              message += f"\nRegion: {region}\n"
+                              last_region = region
+                          
+                          message += process_instance(instance_id, instance_name, cloudwatch_client)
+          
+              sns_client.publish(TopicArn=os.environ['TOPIC_ARN'], Message=message)
+          
+          def process_instance(instance_id, instance_name, cloudwatch_client):
+              now = datetime.datetime.utcnow()
+              start_current_month = datetime.datetime(now.year, now.month, 1)
+              end_current_month = now
+              start_prev_month = (start_current_month - datetime.timedelta(days=1)).replace(day=1)
+              end_prev_month = start_current_month - datetime.timedelta(days=1)
+          
+              message = f"    Instance ID: {instance_id}, Name: {instance_name}\n"
+          
+              metrics = [
+                  ('CPUUtilization', 'AWS/EC2', 'Average'),
+                  ('NetworkIn', 'AWS/EC2', 'Sum'),
+                  ('NetworkOut', 'AWS/EC2', 'Sum'),
+                  ('mem_used_percent', CWAGENT_NAMESPACE, 'Average'),
+                  ('disk_used_percent', CWAGENT_NAMESPACE, 'Average'),
+              ]
+          
+              for metric_name, namespace, statistic in metrics:
+                  current_data = get_metric_statistics(cloudwatch_client, instance_id, start_current_month, end_current_month, metric_name, statistic, namespace)
+                  previous_data = get_metric_statistics(cloudwatch_client, instance_id, start_prev_month, end_prev_month, metric_name, statistic, namespace)
+          
+                  if statistic == 'Average':
+                      current_avg = calculate_average(current_data)
+                      previous_avg = calculate_average(previous_data)
+                  elif statistic == 'Sum':
+                      current_avg = sum_datapoints(current_data) / (1024**3)  # Convert from Bytes to GB
+                      previous_avg = sum_datapoints(previous_data) / (1024**3)
+                      metric_name += " (GB)"  # Indicate the unit for network metrics
+          
+                  unit = '%' if 'percent' in metric_name else ''
+                  message += f"        {metric_name} - Current: {current_avg:.2f}{unit}, Previous: {previous_avg:.2f}{unit}\n"
+          
+              return message
+          
+          def get_metric_statistics(cloudwatch_client, instance_id, start, end, metric_name, statistic, namespace):
+              return cloudwatch_client.get_metric_statistics(
+                  Namespace=namespace,
+                  MetricName=metric_name,
+                  Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                  StartTime=start,
+                  EndTime=end,
+                  Period=3600,
+                  Statistics=[statistic]
+              )['Datapoints']
+          
+          def calculate_average(datapoints):
+              total = sum(dp['Average'] for dp in datapoints) if datapoints else 0
+              return total / len(datapoints) if datapoints else 0
+          
+          def sum_datapoints(datapoints):
+              return sum(dp['Sum'] for dp in datapoints) if datapoints else 0
+          
+          if __name__ == "__main__":
+              lambda_handler(None, None)
+      Environment:
+        Variables:
+          TOPIC_ARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - cloudwatch:GetMetricStatistics
+                  - ec2:DescribeRegions
+                  - sns:Publish
+                Resource: '*'
+      Tags:
+        - Key: 'Name'
+          Value: !Ref 'AWS::StackName'
+
+  ec2cpunetworkMonthlyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref 'AWS::StackName'
+      ScheduleExpression: !Ref ScheduleExpression
+      Targets:
+        - Arn: !GetAtt ec2cpunetworkfunction.Arn
+          Id: MonthlyLambdaTrigger
+      State: ENABLED
+
+  LambdaPermissionForEventsToInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ec2cpunetworkfunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ec2cpunetworkMonthlyTrigger.Arn
+
+Outputs:
+  LambdaFunctionARN:
+    Description: The ARN of the Lambda function
+    Value: !GetAtt ec2cpunetworkfunction.Arn
